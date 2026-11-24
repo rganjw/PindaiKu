@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../services/storage_service.dart';
+import '../utils/app_constants.dart';
+import '../widgets/shared_widgets.dart';
 import 'home_screen.dart';
 import 'register_screen.dart';
 
@@ -12,34 +14,57 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _emailController = TextEditingController();
-  final _passController = TextEditingController();
-  final _storage = StorageService();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passController = TextEditingController();
+  final StorageService _storage = StorageService();
   bool _obscurePass = true;
+  bool _isSubmitting = false;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passController.dispose();
+    super.dispose();
+  }
 
   Future<void> _login() async {
-    if (_emailController.text.trim().isEmpty ||
-        _passController.text.trim().isEmpty) {
+    if (_isSubmitting) return;
+
+    final String email = _emailController.text.trim();
+    final String password = _passController.text.trim();
+
+    if (email.isEmpty || password.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Masukkan email dan kata sandi!')),
+        const SnackBar(
+          content: Text('Masukkan email dan kata sandi!'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
       );
       return;
     }
 
-    final errorMessage = await _storage.loginUser(
-      _emailController.text.trim(),
-      _passController.text.trim(),
-    );
+    _isSubmitting = true;
+    try {
+      final String? errorMessage = await _storage.loginUser(email, password);
 
-    if (!mounted) return;
-    if (errorMessage == null) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-      );
-    } else {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(errorMessage)));
+      if (!mounted) return;
+      if (errorMessage == null) {
+        await Navigator.pushReplacement(
+          context,
+          MaterialPageRoute<void>(builder: (_) => const HomeScreen()),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } finally {
+      _isSubmitting = false;
     }
   }
 
@@ -54,77 +79,9 @@ class _LoginScreenState extends State<LoginScreen> {
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 400),
               child: Column(
-                children: [
-                  // Logo Lingkaran PindaiKu
-                  Container(
-                    width: 150,
-                    height: 150,
-                    decoration: const BoxDecoration(
-                      color: Color(0xFFF3F6FA),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        Container(
-                          width: 105,
-                          height: 105,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: const Color(0xFF00ACC1),
-                              width: 3,
-                            ),
-                          ),
-                        ),
-                        Container(
-                          width: 82,
-                          height: 82,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: const Color(0xFF263238),
-                              width: 2.5,
-                            ),
-                          ),
-                        ),
-                        const Icon(
-                          Icons.person_search_rounded,
-                          size: 56,
-                          color: Color(0xFF263238),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  RichText(
-                    text: const TextSpan(
-                      style: TextStyle(
-                        fontSize: 26,
-                        fontWeight: FontWeight.bold,
-                      ),
-                      children: [
-                        TextSpan(
-                          text: 'Pindai',
-                          style: TextStyle(color: Color(0xFF263238)),
-                        ),
-                        TextSpan(
-                          text: 'Ku',
-                          style: TextStyle(color: Color(0xFF00ACC1)),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  const Text(
-                    'Masuk',
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF263238),
-                    ),
-                  ),
-                  const SizedBox(height: 24),
+                children: <Widget>[
+                  const PindaiKuLogo(),
+                  const SizedBox(height: 42),
                   const Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
@@ -136,20 +93,14 @@ class _LoginScreenState extends State<LoginScreen> {
                   TextField(
                     controller: _emailController,
                     keyboardType: TextInputType.emailAddress,
-                    decoration: InputDecoration(
-                      suffixIcon: const Icon(Icons.mail_outline, size: 20),
-                      contentPadding: const EdgeInsets.symmetric(
+                    decoration: const InputDecoration(
+                      suffixIcon: Icon(Icons.mail_outline, size: 20),
+                      contentPadding: EdgeInsets.symmetric(
                         horizontal: 16,
                         vertical: 14,
                       ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
+                      border: AppConstants.inputBorder,
+                      enabledBorder: AppConstants.inputBorder,
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -164,6 +115,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   TextField(
                     controller: _passController,
                     obscureText: _obscurePass,
+                    onSubmitted: (_) => _login(),
                     decoration: InputDecoration(
                       suffixIcon: IconButton(
                         icon: Icon(
@@ -179,32 +131,18 @@ class _LoginScreenState extends State<LoginScreen> {
                         horizontal: 16,
                         vertical: 14,
                       ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
+                      border: AppConstants.inputBorder,
+                      enabledBorder: AppConstants.inputBorder,
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: Text(
-                      'Lupa Kata Sandi?',
-                      style: TextStyle(fontSize: 11, color: Colors.grey[600]),
-                    ),
-                  ),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: 32),
                   SizedBox(
                     width: double.infinity,
                     height: 48,
                     child: ElevatedButton(
                       onPressed: _login,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF1967D2),
+                        backgroundColor: AppConstants.primaryBlue,
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(24),
@@ -223,7 +161,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   const SizedBox(height: 16),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
+                    children: <Widget>[
                       const Text(
                         'Belum punya akun? ',
                         style: TextStyle(fontSize: 12, color: Colors.grey),
@@ -231,7 +169,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       GestureDetector(
                         onTap: () => Navigator.pushReplacement(
                           context,
-                          MaterialPageRoute(
+                          MaterialPageRoute<void>(
                             builder: (_) => const RegisterScreen(),
                           ),
                         ),
@@ -239,7 +177,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           'Daftar',
                           style: TextStyle(
                             fontSize: 12,
-                            color: Color(0xFF1967D2),
+                            color: AppConstants.primaryBlue,
                             fontWeight: FontWeight.bold,
                           ),
                         ),

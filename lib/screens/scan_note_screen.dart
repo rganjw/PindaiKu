@@ -5,16 +5,13 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:pdf/pdf.dart';
-import 'package:pdf/widgets.dart' as pw;
-import 'package:printing/printing.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/note_model.dart';
+import '../services/scan_export_service.dart';
 import '../services/storage_service.dart';
-import '../utils/web_helper.dart';
+import '../utils/app_constants.dart';
+import '../widgets/shared_widgets.dart';
 
 class ScanNoteScreen extends StatefulWidget {
   const ScanNoteScreen({super.key});
@@ -23,19 +20,30 @@ class ScanNoteScreen extends StatefulWidget {
   State<ScanNoteScreen> createState() => _ScanNoteScreenState();
 }
 
-class _ScanNoteScreenState extends State<ScanNoteScreen> {
-  final _titleController = TextEditingController(
+class _ScanNoteScreenState extends State<ScanNoteScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  final TextEditingController _titleController = TextEditingController(
     text: 'PindaiKu - Dokumen.pdf',
   );
-  final _contentController = TextEditingController();
-  final _picker = ImagePicker();
+  final TextEditingController _contentController = TextEditingController();
+  final ImagePicker _picker = ImagePicker();
+  final StorageService _storage = StorageService();
+  final ScanExportService _exportService = const ScanExportService();
 
   CameraController? _cameraController;
   List<CameraDescription>? _cameras;
+  Future<void> _cameraOpQueue = Future<void>.value();
+  int _scanSessionId = 0;
   bool _isCameraInitialized = false;
+  bool _isCapturing = false;
+  bool _isExternalPickerActive = false;
 
-  String _selectedCategory = 'Dokumen';
-  List<String> _categories = ['Dokumen'];
+  late final AnimationController _scanAnimationController;
+  late final Animation<double> _scanAnimation;
+
+  String _selectedCategory = AppConstants.defaultFolder;
+  int _dropdownResetNonce = 0;
+  List<String> _categories = <String>[AppConstants.defaultFolder];
   String? _imagePath;
   Uint8List? _imageBytes;
   int _rotationTurns = 0;
@@ -43,19 +51,145 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
   bool _flashOn = false;
   bool _isResultStep = false;
   bool _isScanning = false;
+  bool _isSaving = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initCamera();
     _loadFolders();
+
+    _scanAnimationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2500),
+    )..repeat(reverse: true);
+
+    _scanAnimation = Tween<double>(begin: -0.9, end: 0.9).animate(
+      CurvedAnimation(
+        parent: _scanAnimationController,
+        curve: Curves.easeInOut,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _scanAnimationController.dispose();
+    final CameraController? controller = _cameraController;
+    _cameraController = null;
+    controller?.dispose();
+    _titleController.dispose();
+    _contentController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _enqueueCameraOp(Future<void> Function() action) {
+    final Future<void> next = _cameraOpQueue.then((_) => action()).catchError((
+      Object e,
+    ) {
+      debugPrint('Camera operation error: $e');
+    });
+    _cameraOpQueue = next;
+    return next;
+  }
+
+  Future<void> _releaseCamera() {
+    return _enqueueCameraOp(() async {
+      final CameraController? controller = _cameraController;
+      if (controller == null) return;
+
+      final bool wasFlashOn = _flashOn;
+      _cameraController = null;
+
+      if (mounted) {
+        setState(() {
+          _isCameraInitialized = false;
+          _flashOn = false;
+        });
+        final AppLifecycleState? lifecycle =
+            WidgetsBinding.instance.lifecycleState;
+        if (lifecycle == null || lifecycle == AppLifecycleState.resumed) {
+          // Pastikan widget CameraPreview sudah terlepas dari tree pada frame ini
+          // sebelum controller.dispose(), dengan batas 100ms bila VSync berhenti.
+          await WidgetsBinding.instance.endOfFrame.timeout(
+            const Duration(milliseconds: 100),
+            onTimeout: () {},
+          );
+        }
+      }
+
+      if (wasFlashOn && controller.value.isInitialized) {
+        try {
+          await controller.setFlashMode(FlashMode.off);
+        } on Exception catch (_) {}
+      }
+
+      try {
+        await controller.dispose();
+      } on Exception catch (e) {
+        debugPrint('Error disposing camera: $e');
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_isExternalPickerActive) return;
+
+    if (state == AppLifecycleState.inactive) {
+      _scanAnimationController.stop();
+      _releaseCamera();
+    } else if (state == AppLifecycleState.resumed) {
+      if (!_isResultStep) {
+        if (!_scanAnimationController.isAnimating) {
+          _scanAnimationController.repeat(reverse: true);
+        }
+        _initCamera();
+      }
+    }
+  }
+
+  Future<void> _enterResultStep({
+    required Uint8List bytes,
+    required String path,
+  }) async {
+    _scanSessionId++;
+    _scanAnimationController.stop();
+
+    if (!mounted) return;
+    setState(() {
+      _imageBytes = bytes;
+      _imagePath = path;
+      _rotationTurns = 0;
+      _isScanning = false;
+      _isResultStep = true;
+      _contentController.clear();
+    });
+
+    await _releaseCamera();
+  }
+
+  Future<void> _returnToCameraStep() async {
+    _scanSessionId++;
+    setState(() {
+      _isScanning = false;
+      _isResultStep = false;
+    });
+    if (!_scanAnimationController.isAnimating) {
+      _scanAnimationController.repeat(reverse: true);
+    }
+    await _initCamera();
   }
 
   Future<void> _loadFolders() async {
-    final folders = await StorageService().getFolders();
+    final List<String> folders = await _storage.getFolders();
     if (mounted) {
       setState(() {
-        _categories = folders.isNotEmpty ? folders : ['Dokumen'];
+        _categories = folders.isNotEmpty
+            ? folders
+            : <String>[AppConstants.defaultFolder];
         if (!_categories.contains(_selectedCategory)) {
           _selectedCategory = _categories.first;
         }
@@ -63,96 +197,96 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
     }
   }
 
-  void _showAddFolderDialog() {
-    final folderInputController = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.create_new_folder_outlined, color: Color(0xFF00ACC1)),
-            SizedBox(width: 8),
-            Text('Buat Folder Baru', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: TextField(
-          controller: folderInputController,
-          autofocus: true,
-          decoration: InputDecoration(
-            labelText: 'Nama Folder',
-            hintText: 'Contoh: Pekerjaan, Pribadi, dll.',
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal', style: TextStyle(color: Colors.grey)),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final newName = folderInputController.text.trim();
-              if (newName.isNotEmpty) {
-                await StorageService().saveFolder(newName);
-                if (mounted) {
-                  setState(() {
-                    if (!_categories.contains(newName)) {
-                      _categories.add(newName);
-                    }
-                    _selectedCategory = newName;
-                  });
-                }
-              }
-              if (ctx.mounted) Navigator.pop(ctx);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1967D2),
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            ),
-            child: const Text('Simpan Folder'),
-          ),
-        ],
-      ),
+  Future<void> _showAddFolderDialog() async {
+    final String? newName = await showCreateFolderDialog(
+      context,
+      hintText: 'Contoh: Pekerjaan, Pribadi, dll.',
+      confirmLabel: 'Simpan Folder',
     );
+    if (newName == null || newName.isEmpty) return;
+
+    await _storage.saveFolder(newName);
+    if (!mounted) return;
+    setState(() {
+      if (!_categories.contains(newName)) {
+        _categories.add(newName);
+      }
+      _selectedCategory = newName;
+    });
   }
 
-  Future<void> _initCamera() async {
-    try {
-      _cameras = await availableCameras();
-      if (_cameras != null && _cameras!.isNotEmpty) {
-        final backCamera = _cameras!.firstWhere(
-          (c) => c.lensDirection == CameraLensDirection.back,
-          orElse: () => _cameras!.first,
-        );
-        _cameraController = CameraController(
-          backCamera,
-          ResolutionPreset.high,
-          enableAudio: false,
-        );
-        await _cameraController!.initialize();
-        if (mounted) {
-          setState(() {
-            _isCameraInitialized = true;
-          });
-        }
+  Future<void> _initCamera() {
+    return _enqueueCameraOp(() async {
+      if (!mounted || _isResultStep) return;
+      if (_cameraController != null && _cameraController!.value.isInitialized) {
+        return;
       }
-    } catch (e) {
-      debugPrint('Error initializing camera: $e');
-    }
+
+      try {
+        _cameras ??= await availableCameras();
+        final List<CameraDescription>? cameras = _cameras;
+        if (cameras == null || cameras.isEmpty) return;
+
+        final CameraDescription backCamera = cameras.firstWhere(
+          (CameraDescription c) => c.lensDirection == CameraLensDirection.back,
+          orElse: () => cameras.first,
+        );
+
+        CameraController? initializedController;
+        for (int attempt = 0; attempt < 2; attempt++) {
+          final CameraController candidate = CameraController(
+            backCamera,
+            ResolutionPreset.high,
+            enableAudio: false,
+          );
+          try {
+            await candidate.initialize();
+            initializedController = candidate;
+            break;
+          } on Exception catch (e) {
+            await candidate.dispose();
+            if (attempt == 0) {
+              // Beri jeda singkat jika HAL kamera OS masih melepas sesi sebelumnya
+              await Future<void>.delayed(const Duration(milliseconds: 200));
+            } else {
+              debugPrint('Error initializing camera: $e');
+            }
+          }
+        }
+
+        if (initializedController == null) return;
+
+        if (!mounted || _isResultStep) {
+          await initializedController.dispose();
+          return;
+        }
+
+        _cameraController = initializedController;
+        setState(() {
+          _isCameraInitialized = true;
+          _flashOn = false;
+        });
+      } on Exception catch (e) {
+        debugPrint('Error initializing camera: $e');
+      }
+    });
   }
 
   Future<void> _toggleFlash() async {
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
+    final CameraController? controller = _cameraController;
+    if (controller != null && controller.value.isInitialized) {
       try {
-        final newFlash = !_flashOn;
-        await _cameraController!.setFlashMode(
+        final bool newFlash = !_flashOn;
+        await controller.setFlashMode(
           newFlash ? FlashMode.torch : FlashMode.off,
         );
-        setState(() => _flashOn = newFlash);
-      } catch (_) {
-        setState(() => _flashOn = !_flashOn);
+        if (mounted) {
+          setState(() => _flashOn = newFlash);
+        }
+      } on Exception catch (_) {
+        if (mounted) {
+          setState(() => _flashOn = !_flashOn);
+        }
       }
     } else {
       setState(() => _flashOn = !_flashOn);
@@ -160,100 +294,105 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
   }
 
   Future<void> _takeLivePicture() async {
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
-      try {
-        final XFile file = await _cameraController!.takePicture();
-        final bytes = await file.readAsBytes();
-        setState(() {
-          _imageBytes = bytes;
-          _imagePath = file.path;
-          _rotationTurns = 0;
-          _isResultStep = true;
-          _contentController.clear();
-        });
+    if (_isCapturing) return;
+    _isCapturing = true;
+    try {
+      final CameraController? controller = _cameraController;
+      if (controller != null && controller.value.isInitialized) {
+        try {
+          final XFile file = await controller.takePicture();
+          final Uint8List bytes = await file.readAsBytes();
+          await _enterResultStep(bytes: bytes, path: file.path);
 
-        if (_autoScan) {
-          await _runOcr();
+          if (_autoScan) {
+            await _runOcr();
+          }
+          return;
+        } on Exception catch (e) {
+          debugPrint('Error taking picture: $e');
         }
-        return;
-      } catch (e) {
-        debugPrint('Error taking picture: $e');
       }
+      // Fallback jika kamera live belum siap
+      await _captureOrPick(ImageSource.camera);
+    } finally {
+      _isCapturing = false;
     }
-    // Fallback jika kamera live belum siap
-    await _captureOrPick(ImageSource.camera);
-  }
-
-  @override
-  void dispose() {
-    _cameraController?.dispose();
-    _titleController.dispose();
-    _contentController.dispose();
-    super.dispose();
   }
 
   Future<void> _captureOrPick(ImageSource source) async {
+    _isExternalPickerActive = true;
+    _scanAnimationController.stop();
+    await _releaseCamera();
     try {
       final XFile? picked = await _picker.pickImage(
         source: source,
         maxWidth: 1024,
         imageQuality: 85,
       );
-      if (picked == null) return;
-
-      final bytes = await picked.readAsBytes();
-      String savedPath = picked.path;
-      if (kIsWeb) {
-        savedPath = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+      if (picked == null) {
+        if (mounted && !_isResultStep) {
+          if (!_scanAnimationController.isAnimating) {
+            _scanAnimationController.repeat(reverse: true);
+          }
+          await _initCamera();
+        }
+        return;
       }
 
-      setState(() {
-        _imageBytes = bytes;
-        _imagePath = savedPath;
-        _rotationTurns = 0;
-        _isResultStep = true;
-        _contentController.clear();
-      });
+      final Uint8List bytes = await picked.readAsBytes();
+      final String savedPath = kIsWeb
+          ? 'data:image/jpeg;base64,${base64Encode(bytes)}'
+          : picked.path;
+
+      await _enterResultStep(bytes: bytes, path: savedPath);
 
       if (_autoScan) {
         await _runOcr();
       }
-    } catch (e) {
+    } on Exception catch (e) {
+      if (mounted && !_isResultStep) {
+        if (!_scanAnimationController.isAnimating) {
+          _scanAnimationController.repeat(reverse: true);
+        }
+        await _initCamera();
+      }
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Gagal mengambil gambar: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal mengambil gambar: $e'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      _isExternalPickerActive = false;
     }
   }
 
   Future<void> _runOcr() async {
-    if (_imagePath == null) return;
+    final String? path = _imagePath;
+    if (path == null || _isScanning) return;
+    final int currentSession = _scanSessionId;
     setState(() => _isScanning = true);
 
     try {
-      String extractedText = '';
+      final String extractedText = await _exportService.extractText(path);
 
-      if (!kIsWeb) {
-        final inputImage = InputImage.fromFilePath(_imagePath!);
-        final textRecognizer = TextRecognizer(
-          script: TextRecognitionScript.latin,
-        );
-        final RecognizedText recognizedText = await textRecognizer.processImage(
-          inputImage,
-        );
-        await textRecognizer.close();
-        extractedText = recognizedText.text;
-      } else {
-        extractedText = await runWebOcr(_imagePath!);
+      if (!mounted || !_isResultStep || currentSession != _scanSessionId) {
+        return;
       }
-
       setState(() {
-        _contentController.text = extractedText.isNotEmpty ? extractedText : 'Teks pada gambar kurang jelas terbaca. Pastikan foto terang dan tidak buram.';
+        _contentController.text = extractedText.isNotEmpty
+            ? extractedText
+            : 'Teks pada gambar kurang jelas terbaca. Pastikan foto terang dan tidak buram.';
         _isScanning = false;
       });
 
-      if (!mounted) return;
       _showOcrEditorDialog();
-    } catch (e) {
+    } on Exception catch (e) {
+      if (!mounted || !_isResultStep || currentSession != _scanSessionId) {
+        return;
+      }
       setState(() {
         _contentController.text = 'Gagal memproses OCR: $e';
         _isScanning = false;
@@ -262,148 +401,95 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
   }
 
   Future<void> _shareAsPdf() async {
+    _isExternalPickerActive = true;
     try {
-      final pdf = pw.Document();
-      final docTitle = _titleController.text.trim().isEmpty
-          ? 'Catatan_PindaiKu.pdf'
-          : _titleController.text.trim();
-      final ocrText = _contentController.text.trim().isEmpty
-          ? '(Belum ada teks hasil OCR)'
-          : _contentController.text.trim();
-
-      pw.MemoryImage? pdfImage;
-      if (_imageBytes != null) {
-        pdfImage = pw.MemoryImage(_imageBytes!);
-      }
-
-      pdf.addPage(
-        pw.MultiPage(
-          pageFormat: PdfPageFormat.a4,
-          build: (pw.Context context) => [
-            pw.Header(
-              level: 0,
-              child: pw.Text(
-                docTitle,
-                style: pw.TextStyle(
-                  fontSize: 20,
-                  fontWeight: pw.FontWeight.bold,
-                ),
-              ),
-            ),
-            pw.Text(
-              'Folder: $_selectedCategory',
-              style: const pw.TextStyle(fontSize: 12, color: PdfColors.grey700),
-            ),
-            pw.SizedBox(height: 16),
-            if (pdfImage != null) ...[
-              pw.Center(
-                child: pw.Container(
-                  height: 280,
-                  child: pw.Image(pdfImage, fit: pw.BoxFit.contain),
-                ),
-              ),
-              pw.SizedBox(height: 16),
-            ],
-            pw.Text(
-              'Hasil Konversi Teks (OCR):',
-              style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold),
-            ),
-            pw.SizedBox(height: 8),
-            pw.Text(ocrText, style: const pw.TextStyle(fontSize: 12)),
-          ],
+      await _exportService.shareAsPdf(
+        rawTitle: _titleController.text,
+        rawContent: _contentController.text,
+        category: _selectedCategory,
+        imageBytes: _imageBytes,
+        rotationTurns: _rotationTurns,
+      );
+    } on Exception catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal membuat PDF: $e'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
         ),
       );
-
-      final pdfBytes = await pdf.save();
-      final fileName = docTitle.toLowerCase().endsWith('.pdf')
-          ? docTitle
-          : '$docTitle.pdf';
-
-      await Printing.sharePdf(bytes: pdfBytes, filename: fileName);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Gagal membuat PDF: $e')));
+    } finally {
+      _isExternalPickerActive = false;
     }
   }
 
   Future<void> _exportAsJpeg() async {
-    if (_imageBytes == null || _imagePath == null) {
+    final Uint8List? bytes = _imageBytes;
+    final String? path = _imagePath;
+    if (bytes == null || path == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Tidak ada gambar untuk diekspor!')),
+        const SnackBar(
+          content: Text('Tidak ada gambar untuk diekspor!'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
       );
       return;
     }
 
+    _isExternalPickerActive = true;
     try {
-      final baseName = _titleController.text
-          .trim()
-          .replaceAll('.pdf', '')
-          .replaceAll(' ', '_');
-      final fileName = '${baseName.isEmpty ? 'PindaiKu' : baseName}.jpg';
-
-      if (kIsWeb) {
-        downloadWebImage(_imagePath!, fileName);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('File $fileName berhasil diunduh!')),
-        );
-      } else {
-        final dir = Directory.systemTemp;
-        final file = File('${dir.path}/$fileName');
-        await file.writeAsBytes(_imageBytes!);
-
-        // Coba simpan salinan langsung ke folder publik Download di Android
-        String savedMsg = '';
-        try {
-          final publicDownloadDir = Directory('/storage/emulated/0/Download');
-          if (await publicDownloadDir.exists()) {
-            final publicFile = File('${publicDownloadDir.path}/$fileName');
-            await publicFile.writeAsBytes(_imageBytes!);
-            savedMsg = ' & tersimpan di folder Download';
-          }
-        } catch (_) {}
-
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('File $fileName siap dibagikan$savedMsg!')),
-        );
-
-        // Buka Android share sheet agar user bisa simpan ke Galeri / WA / Drive dll
-        await SharePlus.instance.share(
-          ShareParams(
-            files: [XFile(file.path, mimeType: 'image/jpeg', name: fileName)],
-            text: 'Catatan JPEG PindaiKu: $fileName',
-          ),
-        );
-      }
-    } catch (e) {
+      await _exportService.exportAsJpeg(
+        rawTitle: _titleController.text,
+        imagePath: path,
+        imageBytes: bytes,
+        onReadyMessage: (String message, {required bool isWeb}) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(message),
+              backgroundColor: isWeb ? Colors.green : null,
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        },
+      );
+    } on Exception catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Gagal ekspor JPEG: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal ekspor JPEG: $e'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      _isExternalPickerActive = false;
     }
   }
 
   void _showOcrEditorDialog() {
-    showModalBottomSheet(
+    showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (ctx) => Padding(
+      builder: (BuildContext ctx) => Padding(
         padding: EdgeInsets.fromLTRB(
           24,
           24,
           24,
-          MediaQuery.of(ctx).viewInsets.bottom + 24,
+          MediaQuery.viewInsetsOf(ctx).bottom + 24,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+          children: <Widget>[
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
+              children: <Widget>[
                 const Text(
                   'Edit Teks Catatan (Hasil OCR)',
                   style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
@@ -416,7 +502,10 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                       ClipboardData(text: _contentController.text),
                     );
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Teks disalin!')),
+                      const SnackBar(
+                        content: Text('Teks disalin!'),
+                        behavior: SnackBarBehavior.floating,
+                      ),
                     );
                   },
                 ),
@@ -440,7 +529,7 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
               child: ElevatedButton(
                 onPressed: () => Navigator.pop(ctx),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF1967D2),
+                  backgroundColor: AppConstants.primaryBlue,
                   foregroundColor: Colors.white,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
@@ -455,49 +544,60 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
     );
   }
 
-  void _saveDocument() async {
-    final title = _titleController.text.trim().isEmpty
-        ? 'Pemindaian Baru'
-        : _titleController.text.trim();
-    final content = _contentController.text.trim().isEmpty
-        ? 'Catatan hasil pemindaian dokumen.'
-        : _contentController.text.trim();
+  Future<void> _saveDocument() async {
+    if (_isSaving) return;
+    _isSaving = true;
+    try {
+      final String title = _titleController.text.trim().isEmpty
+          ? 'Pemindaian Baru'
+          : _titleController.text.trim();
+      final String content = _contentController.text.trim().isEmpty
+          ? 'Catatan hasil pemindaian dokumen.'
+          : _contentController.text.trim();
 
-    await StorageService().saveFolder(_selectedCategory);
+      await _storage.saveFolder(_selectedCategory);
 
-    final note = NoteModel(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      title: title,
-      subject: 'Umum',
-      category: _selectedCategory,
-      content: content,
-      createdAt: DateTime.now(),
-      imagePath: _imagePath,
-    );
+      final NoteModel note = NoteModel(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        title: title,
+        subject: 'Umum',
+        category: _selectedCategory,
+        content: content,
+        createdAt: DateTime.now(),
+        imagePath: _imagePath,
+      );
 
-    if (!mounted) return;
-    Navigator.pop(context, note);
+      if (!mounted) return;
+      Navigator.pop(context, note);
+    } finally {
+      _isSaving = false;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     if (!_isResultStep) {
+      final CameraController? controller = _cameraController;
       return Scaffold(
-        backgroundColor: const Color(0xFF1A1A1A),
+        backgroundColor: AppConstants.scannerDarkBg,
         body: SafeArea(
           child: Stack(
-            children: [
+            children: <Widget>[
               Center(
                 child: Container(
-                  margin: const EdgeInsets.symmetric(
-                    horizontal: 28,
-                    vertical: 76,
+                  margin: const EdgeInsets.only(
+                    left: 28,
+                    right: 28,
+                    top: 60,
+                    bottom: 120,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF2B2B2B),
+                    color: AppConstants.scannerCardBg,
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(
-                      color: const Color(0xFF29B6F6).withOpacity(0.6),
+                      color: AppConstants.scannerLaserBlue.withValues(
+                        alpha: 0.6,
+                      ),
                       width: 2,
                     ),
                   ),
@@ -505,50 +605,65 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                     borderRadius: BorderRadius.circular(14),
                     child: Stack(
                       alignment: Alignment.center,
-                      children: [
-                        if (_isCameraInitialized && _cameraController != null)
+                      children: <Widget>[
+                        if (_isCameraInitialized && controller != null)
                           SizedBox.expand(
                             child: FittedBox(
                               fit: BoxFit.cover,
                               child: SizedBox(
-                                width: _cameraController!.value.previewSize?.height ?? 1,
-                                height: _cameraController!.value.previewSize?.width ?? 1,
-                                child: CameraPreview(_cameraController!),
+                                width:
+                                    controller.value.previewSize?.height ?? 1,
+                                height:
+                                    controller.value.previewSize?.width ?? 1,
+                                child: CameraPreview(
+                                  controller,
+                                  key: ObjectKey(controller),
+                                ),
                               ),
                             ),
                           )
                         else
                           Column(
                             mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
+                            children: <Widget>[
                               Icon(
                                 Icons.document_scanner_outlined,
                                 size: 64,
-                                color: Colors.white.withOpacity(0.5),
+                                color: Colors.white.withValues(alpha: 0.5),
                               ),
                               const SizedBox(height: 12),
                               Text(
                                 'Arahkan ke teks atau dokumen\nlalu tekan tombol rana di bawah',
                                 textAlign: TextAlign.center,
                                 style: TextStyle(
-                                  color: Colors.white.withOpacity(0.75),
+                                  color: Colors.white.withValues(alpha: 0.75),
                                   fontSize: 13,
                                 ),
                               ),
                             ],
                           ),
-                        Container(
-                          height: 3,
-                          width: double.infinity,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF29B6F6),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF29B6F6).withOpacity(0.8),
-                                blurRadius: 12,
-                                spreadRadius: 2,
-                              ),
-                            ],
+                        AnimatedBuilder(
+                          animation: _scanAnimation,
+                          builder: (BuildContext context, Widget? child) {
+                            return Align(
+                              alignment: Alignment(0, _scanAnimation.value),
+                              child: child,
+                            );
+                          },
+                          child: Container(
+                            height: 3,
+                            width: double.infinity,
+                            decoration: BoxDecoration(
+                              color: AppConstants.scannerLaserBlue,
+                              boxShadow: <BoxShadow>[
+                                BoxShadow(
+                                  color: AppConstants.scannerLaserBlue
+                                      .withValues(alpha: 0.8),
+                                  blurRadius: 12,
+                                  spreadRadius: 2,
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ],
@@ -562,7 +677,7 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                 right: 16,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
+                  children: <Widget>[
                     IconButton(
                       icon: const Icon(
                         Icons.close,
@@ -583,63 +698,79 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                 ),
               ),
               Positioned(
-                bottom: 24,
-                left: 28,
-                right: 28,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    GestureDetector(
-                      onTap: () => _captureOrPick(ImageSource.gallery),
-                      child: const Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.photo_library_outlined,
-                            color: Colors.white,
-                            size: 28,
+                bottom: 30,
+                left: 0,
+                right: 0,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 40),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: <Widget>[
+                      GestureDetector(
+                        onTap: () => _captureOrPick(ImageSource.gallery),
+                        child: const SizedBox(
+                          width: 60,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              Icon(
+                                Icons.photo_library_outlined,
+                                color: Colors.white,
+                                size: 28,
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                'Gallery',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
                           ),
-                          SizedBox(height: 4),
-                          Text(
-                            'Gallery',
-                            style: TextStyle(color: Colors.white, fontSize: 12),
-                          ),
-                        ],
-                      ),
-                    ),
-                    GestureDetector(
-                      onTap: _takeLivePicture,
-                      child: Container(
-                        width: 72,
-                        height: 72,
-                        padding: const EdgeInsets.all(5),
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white, width: 3.5),
                         ),
+                      ),
+                      GestureDetector(
+                        onTap: _takeLivePicture,
                         child: Container(
-                          decoration: const BoxDecoration(
-                            color: Colors.white,
+                          width: 72,
+                          height: 72,
+                          padding: const EdgeInsets.all(5),
+                          decoration: BoxDecoration(
                             shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 3.5),
+                          ),
+                          child: Container(
+                            decoration: const BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                    Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Switch(
-                          value: _autoScan,
-                          activeColor: const Color(0xFF00ACC1),
-                          onChanged: (val) => setState(() => _autoScan = val),
+                      SizedBox(
+                        width: 60,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Switch(
+                              value: _autoScan,
+                              activeThumbColor: AppConstants.accentCyan,
+                              onChanged: (bool val) =>
+                                  setState(() => _autoScan = val),
+                            ),
+                            const Text(
+                              'Auto-Scan',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
                         ),
-                        const Text(
-                          'Auto-Scan',
-                          style: TextStyle(color: Colors.white, fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -648,6 +779,9 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
       );
     }
 
+    final int previewCacheSize =
+        (270 * MediaQuery.devicePixelRatioOf(context)).round();
+
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
@@ -655,10 +789,9 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
         elevation: 0,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Colors.black87),
-          onPressed: () => setState(() => _isResultStep = false),
+          onPressed: _returnToCameraStep,
         ),
-        actions: [
-          // Tombol Putar Foto 90 Derajat (Fungsi Unik 1)
+        actions: <Widget>[
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 10),
             child: ElevatedButton.icon(
@@ -679,46 +812,50 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
               ),
             ),
           ),
-          // Menu Titik Tiga: Edit Teks Manual / Salin Teks / Foto Ulang (Fungsi Unik 2)
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_horiz, color: Colors.black87),
-            onSelected: (value) {
+            onSelected: (String value) {
               if (value == 'edit_text') {
                 _showOcrEditorDialog();
               } else if (value == 'copy_text') {
-                Clipboard.setData(ClipboardData(text: _contentController.text));
+                Clipboard.setData(
+                  ClipboardData(text: _contentController.text),
+                );
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Teks catatan disalin!')),
+                  const SnackBar(
+                    content: Text('Teks catatan disalin!'),
+                    behavior: SnackBarBehavior.floating,
+                  ),
                 );
               } else if (value == 'retake') {
-                setState(() => _isResultStep = false);
+                _returnToCameraStep();
               }
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(
+            itemBuilder: (_) => const <PopupMenuEntry<String>>[
+              PopupMenuItem<String>(
                 value: 'edit_text',
                 child: Row(
-                  children: [
+                  children: <Widget>[
                     Icon(Icons.edit_note, size: 20),
                     SizedBox(width: 8),
                     Text('Edit Teks Manual'),
                   ],
                 ),
               ),
-              PopupMenuItem(
+              PopupMenuItem<String>(
                 value: 'copy_text',
                 child: Row(
-                  children: [
+                  children: <Widget>[
                     Icon(Icons.copy_rounded, size: 18),
                     SizedBox(width: 8),
                     Text('Salin Hasil Teks'),
                   ],
                 ),
               ),
-              PopupMenuItem(
+              PopupMenuItem<String>(
                 value: 'retake',
                 child: Row(
-                  children: [
+                  children: <Widget>[
                     Icon(Icons.camera_alt_outlined, size: 18),
                     SizedBox(width: 8),
                     Text('Ambil Ulang Foto'),
@@ -732,13 +869,13 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
       body: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(20, 4, 20, 28),
         child: Column(
-          children: [
+          children: <Widget>[
             Container(
               width: double.infinity,
               height: 270,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: const Color(0xFFD9D9D9),
+                color: AppConstants.previewCanvasBg,
                 borderRadius: BorderRadius.circular(14),
               ),
               child: Center(
@@ -748,19 +885,27 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                     width: 190,
                     decoration: BoxDecoration(
                       color: Colors.white,
-                      boxShadow: [
+                      boxShadow: <BoxShadow>[
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.12),
+                          color: Colors.black.withValues(alpha: 0.12),
                           blurRadius: 10,
                         ),
                       ],
                     ),
                     child: _imageBytes != null
-                        ? Image.memory(_imageBytes!, fit: BoxFit.contain)
+                        ? Image.memory(
+                            _imageBytes!,
+                            cacheWidth: previewCacheSize,
+                            fit: BoxFit.contain,
+                          )
                         : (_imagePath != null && !kIsWeb
                               ? Image.file(
                                   File(_imagePath!),
+                                  cacheWidth: previewCacheSize,
                                   fit: BoxFit.contain,
+                                  errorBuilder: (_, _, _) => const Center(
+                                    child: Icon(Icons.description, size: 48),
+                                  ),
                                 )
                               : const Center(
                                   child: Icon(Icons.description, size: 48),
@@ -769,46 +914,46 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                 ),
               ),
             ),
-            if (_isScanning) ...[
+            if (_isScanning) ...<Widget>[
               const SizedBox(height: 12),
-              const LinearProgressIndicator(color: Color(0xFF00ACC1)),
+              const LinearProgressIndicator(color: AppConstants.accentCyan),
               const SizedBox(height: 6),
               const Text(
                 'Sedang membaca teks dari foto secara otomatis...',
-                style: TextStyle(fontSize: 12, color: Color(0xFF00ACC1)),
+                style: TextStyle(fontSize: 12, color: AppConstants.accentCyan),
               ),
             ],
             const SizedBox(height: 16),
             TextField(
               controller: _titleController,
-              decoration: InputDecoration(
+              decoration: const InputDecoration(
                 labelText: 'Nama Dokumen',
-                suffixIcon: const Icon(Icons.edit_outlined, size: 20),
-                contentPadding: const EdgeInsets.symmetric(
+                suffixIcon: Icon(Icons.edit_outlined, size: 20),
+                contentPadding: EdgeInsets.symmetric(
                   horizontal: 16,
                   vertical: 14,
                 ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.shade300),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.shade300),
-                ),
+                border: AppConstants.inputBorder,
+                enabledBorder: AppConstants.inputBorder,
               ),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
-              value: _categories.contains(_selectedCategory) ? _selectedCategory : null,
+              key: ValueKey<String>('$_selectedCategory:$_dropdownResetNonce'),
+              initialValue: _categories.contains(_selectedCategory)
+                  ? _selectedCategory
+                  : null,
               decoration: InputDecoration(
                 labelText: 'Folder Dokumen',
                 prefixIcon: const Icon(
                   Icons.folder_outlined,
-                  color: Color(0xFF00ACC1),
+                  color: AppConstants.accentCyan,
                 ),
                 suffixIcon: IconButton(
-                  icon: const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00ACC1)),
+                  icon: const Icon(
+                    Icons.create_new_folder_outlined,
+                    color: AppConstants.accentCyan,
+                  ),
                   tooltip: 'Buat Folder Baru',
                   onPressed: _showAddFolderDialog,
                 ),
@@ -816,27 +961,28 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                   horizontal: 16,
                   vertical: 14,
                 ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.shade300),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.shade300),
-                ),
+                border: AppConstants.inputBorder,
+                enabledBorder: AppConstants.inputBorder,
               ),
-              items: [
-                ..._categories.map((c) => DropdownMenuItem(value: c, child: Text(c))),
-                const DropdownMenuItem(
+              items: <DropdownMenuItem<String>>[
+                ..._categories.map(
+                  (String c) =>
+                      DropdownMenuItem<String>(value: c, child: Text(c)),
+                ),
+                const DropdownMenuItem<String>(
                   value: '__new_folder__',
                   child: Row(
-                    children: [
-                      Icon(Icons.add_circle_outline, color: Color(0xFF1967D2), size: 18),
+                    children: <Widget>[
+                      Icon(
+                        Icons.add_circle_outline,
+                        color: AppConstants.primaryBlue,
+                        size: 18,
+                      ),
                       SizedBox(width: 8),
                       Text(
                         '+ Buat Folder Baru...',
                         style: TextStyle(
-                          color: Color(0xFF1967D2),
+                          color: AppConstants.primaryBlue,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
@@ -844,8 +990,10 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                   ),
                 ),
               ],
-              onChanged: (val) {
+              onChanged: (String? val) {
                 if (val == '__new_folder__') {
+                  // Reset dropdown ke kategori aktif terlebih dahulu, lalu buka modal
+                  setState(() => _dropdownResetNonce++);
                   _showAddFolderDialog();
                 } else if (val != null) {
                   setState(() => _selectedCategory = val);
@@ -854,13 +1002,13 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
             ),
             const SizedBox(height: 14),
             Row(
-              children: [
+              children: <Widget>[
                 Expanded(
                   child: OutlinedButton(
                     onPressed: _shareAsPdf,
                     style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFF1967D2),
-                      side: const BorderSide(color: Color(0xFF1967D2)),
+                      foregroundColor: AppConstants.primaryBlue,
+                      side: const BorderSide(color: AppConstants.primaryBlue),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(24),
@@ -877,8 +1025,8 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
                   child: OutlinedButton(
                     onPressed: _exportAsJpeg,
                     style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFF1967D2),
-                      side: const BorderSide(color: Color(0xFF1967D2)),
+                      foregroundColor: AppConstants.primaryBlue,
+                      side: const BorderSide(color: AppConstants.primaryBlue),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(24),
@@ -898,8 +1046,8 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
               child: OutlinedButton(
                 onPressed: _isScanning ? null : _runOcr,
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: const Color(0xFF1967D2),
-                  side: const BorderSide(color: Color(0xFF1967D2)),
+                  foregroundColor: AppConstants.primaryBlue,
+                  side: const BorderSide(color: AppConstants.primaryBlue),
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
@@ -918,7 +1066,7 @@ class _ScanNoteScreenState extends State<ScanNoteScreen> {
               child: ElevatedButton(
                 onPressed: _saveDocument,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF1967D2),
+                  backgroundColor: AppConstants.primaryBlue,
                   foregroundColor: Colors.white,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),

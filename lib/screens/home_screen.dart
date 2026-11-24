@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -6,8 +7,12 @@ import 'package:flutter/services.dart';
 
 import '../models/note_model.dart';
 import '../services/storage_service.dart';
+import '../utils/app_constants.dart';
+import '../widgets/shared_widgets.dart';
 import 'login_screen.dart';
 import 'scan_note_screen.dart';
+
+typedef _NotificationEntry = ({int id, String message});
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -17,17 +22,25 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final _storage = StorageService();
-  final _searchController = TextEditingController();
-  List<NoteModel> _notes = [];
-  List<String> _folders = ['Dokumen'];
-  final List<String> _notifications = [
-    'Selamat datang di PindaiKu! Siap memindai dokumen Anda.',
+  final StorageService _storage = StorageService();
+  final TextEditingController _searchController = TextEditingController();
+
+  List<NoteModel> _notes = <NoteModel>[];
+  List<NoteModel> _filteredNotes = <NoteModel>[];
+  Map<String, int> _folderCounts = <String, int>{};
+  List<String> _folders = <String>[AppConstants.defaultFolder];
+
+  int _nextNotificationId = 2;
+  final List<_NotificationEntry> _notifications = <_NotificationEntry>[
+    (
+      id: 1,
+      message: 'Selamat datang di PindaiKu! Siap memindai dokumen Anda.',
+    ),
   ];
+
   String _userName = 'Jose';
-  String _userEmail = '';
   String _searchQuery = '';
-  String _selectedFolder = 'Semua';
+  String _selectedFolder = AppConstants.allFolders;
 
   @override
   void initState() {
@@ -35,100 +48,138 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadData();
   }
 
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _addNotification(String message) {
+    _notifications.insert(
+      0,
+      (id: _nextNotificationId++, message: message),
+    );
+  }
+
+  void _rebuildFolderCounts() {
+    final Map<String, int> counts = <String, int>{};
+    for (final NoteModel note in _notes) {
+      counts[note.category] = (counts[note.category] ?? 0) + 1;
+    }
+    _folderCounts = counts;
+  }
+
+  void _rebuildFilteredNotes() {
+    final String query = _searchQuery.trim().toLowerCase();
+    final bool hasQuery = query.isNotEmpty;
+    final bool filterByFolder = _selectedFolder != AppConstants.allFolders;
+
+    if (!hasQuery && !filterByFolder) {
+      _filteredNotes = List<NoteModel>.of(_notes);
+      return;
+    }
+
+    final List<NoteModel> result = <NoteModel>[];
+    for (final NoteModel note in _notes) {
+      if (filterByFolder && note.category != _selectedFolder) {
+        continue;
+      }
+      if (hasQuery && !note.searchIndex.contains(query)) {
+        continue;
+      }
+      result.add(note);
+    }
+    _filteredNotes = result;
+  }
+
   Future<void> _loadData() async {
-    final user = await _storage.getActiveUser();
-    final notes = await _storage.getNotes();
-    final savedFolders = await _storage.getFolders();
-    final Set<String> folderSet = {'Dokumen', ...savedFolders};
-    for (var n in notes) {
-      if (n.category.trim().isNotEmpty) {
-        folderSet.add(n.category.trim());
+    final (
+      ActiveUser? user,
+      List<NoteModel> notes,
+      List<String> savedFolders,
+    ) = await (
+      _storage.getActiveUser(),
+      _storage.getNotes(),
+      _storage.getFolders(),
+    ).wait;
+
+    final Set<String> folderSet = <String>{
+      AppConstants.defaultFolder,
+      ...savedFolders,
+    };
+    for (final NoteModel n in notes) {
+      final String trimmedCategory = n.category.trim();
+      if (trimmedCategory.isNotEmpty) {
+        folderSet.add(trimmedCategory);
       }
     }
+
     if (mounted) {
       setState(() {
         if (user != null) {
-          _userName = user['name']!;
-          _userEmail = user['email']!;
+          _userName = user.name;
         }
         _notes = notes;
         _folders = folderSet.toList();
+        _rebuildFolderCounts();
+        _rebuildFilteredNotes();
       });
     }
   }
 
-  void _showCreateFolderDialog() {
-    final folderController = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.create_new_folder_outlined, color: Color(0xFF00ACC1)),
-            SizedBox(width: 8),
-            Text('Buat Folder Baru', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: TextField(
-          controller: folderController,
-          autofocus: true,
-          decoration: InputDecoration(
-            labelText: 'Nama Folder',
-            hintText: 'Contoh: Arsip, Keuangan, Pribadi',
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal', style: TextStyle(color: Colors.grey)),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final name = folderController.text.trim();
-              if (name.isNotEmpty) {
-                await _storage.saveFolder(name);
-                if (mounted) {
-                  setState(() {
-                    if (!_folders.contains(name)) {
-                      _folders.add(name);
-                    }
-                  });
-                }
-              }
-              if (ctx.mounted) Navigator.pop(ctx);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1967D2),
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            ),
-            child: const Text('Simpan'),
-          ),
-        ],
-      ),
+  Future<void> _showCreateFolderModal() async {
+    final String? name = await showCreateFolderDialog(
+      context,
+      hintText: 'Contoh: Arsip, Keuangan, Pribadi',
+      confirmLabel: 'Simpan',
     );
+    if (name == null || name.isEmpty) return;
+
+    await _storage.saveFolder(name);
+    if (!mounted) return;
+    setState(() {
+      if (!_folders.contains(name)) {
+        _folders.add(name);
+      }
+    });
   }
 
   Future<void> _openScanner() async {
-    final NoteModel? result = await Navigator.push(
+    final NoteModel? result = await Navigator.push<NoteModel>(
       context,
-      MaterialPageRoute(builder: (_) => const ScanNoteScreen()),
+      MaterialPageRoute<NoteModel>(builder: (_) => const ScanNoteScreen()),
     );
 
+    // Muat ulang daftar folder jika user sempat membuat folder baru di ScanNoteScreen
+    final List<String> latestFolders = await _storage.getFolders();
+
+    if (!mounted) return;
     if (result != null) {
       setState(() {
         _notes.insert(0, result);
+        for (final String f in latestFolders) {
+          if (!_folders.contains(f)) {
+            _folders.add(f);
+          }
+        }
         if (!_folders.contains(result.category)) {
           _folders.add(result.category);
         }
-        _notifications.insert(
-          0,
+        _addNotification(
           'Berhasil menyimpan "${result.title}" ke folder ${result.category}',
         );
+        _rebuildFolderCounts();
+        _rebuildFilteredNotes();
       });
       await _storage.saveNotes(_notes);
+    } else {
+      setState(() {
+        for (final String f in latestFolders) {
+          if (!_folders.contains(f)) {
+            _folders.add(f);
+          }
+        }
+      });
     }
   }
 
@@ -136,13 +187,13 @@ class _HomeScreenState extends State<HomeScreen> {
     NoteModel note, {
     bool fromModal = false,
   }) async {
-    final confirm = await showDialog<bool>(
+    final bool? confirm = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (BuildContext ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         title: const Text('Hapus Dokumen?'),
         content: Text('Yakin ingin menghapus "${note.title}" secara permanen?'),
-        actions: [
+        actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
             child: const Text('Batal'),
@@ -161,8 +212,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (confirm == true) {
       setState(() {
-        _notes.removeWhere((item) => item.id == note.id);
-        _notifications.insert(0, 'Menghapus dokumen "${note.title}"');
+        _notes.removeWhere((NoteModel item) => item.id == note.id);
+        _addNotification('Menghapus dokumen "${note.title}"');
+        _rebuildFolderCounts();
+        _rebuildFilteredNotes();
       });
       await _storage.saveNotes(_notes);
       if (fromModal && mounted) {
@@ -170,169 +223,286 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('"${note.title}" berhasil dihapus')),
+        SnackBar(
+          content: Text('"${note.title}" berhasil dihapus'),
+          backgroundColor: Colors.green,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _confirmDeleteFolder(String label) async {
+    if (label == AppConstants.defaultFolder) return;
+    final bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text('Hapus Folder?'),
+        content: Text(
+          'Yakin ingin menghapus folder "$label"? Semua dokumen di dalamnya akan dipindahkan ke folder "Dokumen".',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Batal'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Hapus'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await _storage.removeFolder(label);
+      setState(() {
+        _folders.remove(label);
+        if (_selectedFolder == label) {
+          _selectedFolder = AppConstants.allFolders;
+        }
+        for (int i = 0; i < _notes.length; i++) {
+          if (_notes[i].category == label) {
+            _notes[i] = _notes[i].copyWith(
+              category: AppConstants.defaultFolder,
+            );
+          }
+        }
+        _rebuildFolderCounts();
+        _rebuildFilteredNotes();
+      });
+      await _storage.saveNotes(_notes);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Folder "$label" dihapus.'),
+          backgroundColor: Colors.green,
+          behavior: SnackBarBehavior.floating,
+        ),
       );
     }
   }
 
   void _showNotificationsDialog() {
-    showModalBottomSheet(
+    showGeneralDialog<void>(
       context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text(
-                  'Notifikasi & Aktivitas',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                TextButton(
-                  onPressed: () {
-                    setState(() => _notifications.clear());
-                    Navigator.pop(ctx);
-                  },
-                  child: const Text('Bersihkan'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            if (_notifications.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 20),
-                child: Center(child: Text('Tidak ada notifikasi baru.')),
-              )
-            else
-              ..._notifications
-                  .take(5)
-                  .map(
-                    (notif) => ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const CircleAvatar(
-                        backgroundColor: Color(0xFFE0F7FA),
-                        child: Icon(
-                          Icons.notifications_active,
-                          color: Color(0xFF00ACC1),
-                          size: 20,
-                        ),
-                      ),
-                      title: Text(notif, style: const TextStyle(fontSize: 13)),
-                    ),
+      barrierDismissible: true,
+      barrierLabel: 'Tutup',
+      transitionDuration: const Duration(milliseconds: 300),
+      pageBuilder: (
+        BuildContext dialogContext,
+        Animation<double> animation,
+        Animation<double> secondaryAnimation,
+      ) {
+        return StatefulBuilder(
+          builder: (BuildContext panelContext, StateSetter setDialogState) {
+            final int visibleCount = _notifications.length > 10
+                ? 10
+                : _notifications.length;
+
+            return Align(
+              alignment: Alignment.centerRight,
+              child: Material(
+                elevation: 16,
+                child: Container(
+                  width: MediaQuery.sizeOf(panelContext).width * 0.85,
+                  height: double.infinity,
+                  color: Colors.white,
+                  padding: const EdgeInsets.only(
+                    top: 50,
+                    left: 24,
+                    right: 24,
+                    bottom: 24,
                   ),
-          ],
-        ),
-      ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Row(
+                        children: <Widget>[
+                          IconButton(
+                            icon: const Icon(Icons.chevron_right, size: 28),
+                            onPressed: () => Navigator.pop(dialogContext),
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Notifikasi',
+                              style: TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: () {
+                              setState(_notifications.clear);
+                              Navigator.pop(dialogContext);
+                            },
+                            icon: const Icon(
+                              Icons.delete_sweep_outlined,
+                              size: 20,
+                              color: Colors.redAccent,
+                            ),
+                            label: const Text(
+                              'Bersihkan',
+                              style: TextStyle(
+                                color: Colors.redAccent,
+                                fontSize: 13,
+                              ),
+                            ),
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                              ),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      const Divider(),
+                      Expanded(
+                        child: visibleCount == 0
+                            ? const Center(
+                                child: Text('Tidak ada notifikasi baru.'),
+                              )
+                            : ListView.builder(
+                                itemCount: visibleCount,
+                                itemBuilder: (BuildContext context, int index) {
+                                  final _NotificationEntry notif =
+                                      _notifications[index];
+                                  return Dismissible(
+                                    key: ValueKey<int>(notif.id),
+                                    direction: DismissDirection.startToEnd,
+                                    background: Container(
+                                      alignment: Alignment.centerLeft,
+                                      padding: const EdgeInsets.only(left: 20),
+                                      color: Colors.red,
+                                      child: const Icon(
+                                        Icons.delete,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    onDismissed: (_) {
+                                      setState(() {
+                                        _notifications.removeWhere(
+                                          (_NotificationEntry item) =>
+                                              item.id == notif.id,
+                                        );
+                                      });
+                                      setDialogState(() {});
+                                    },
+                                    child: ListTile(
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                            vertical: 8,
+                                          ),
+                                      leading: const CircleAvatar(
+                                        backgroundColor:
+                                            AppConstants.notifAvatarBg,
+                                        child: Icon(
+                                          Icons.notifications_active_outlined,
+                                          color: AppConstants.accentCyan,
+                                        ),
+                                      ),
+                                      title: Text(
+                                        notif.message,
+                                        style: const TextStyle(
+                                          fontSize: 13,
+                                          height: 1.3,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+      transitionBuilder: (
+        BuildContext context,
+        Animation<double> animation,
+        Animation<double> secondaryAnimation,
+        Widget child,
+      ) {
+        return SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(1, 0),
+            end: Offset.zero,
+          ).animate(
+            CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+          ),
+          child: child,
+        );
+      },
     );
   }
 
-  void _showSettingsDialog() {
-    final nameEditController = TextEditingController(text: _userName);
-    showDialog(
+  Future<void> _showSettingsDialog() async {
+    await showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(
-          children: [
-            Icon(Icons.settings, color: Color(0xFF1967D2)),
-            SizedBox(width: 8),
-            Text('Pengaturan Akun'),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Ubah Nama Tampilan',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+      builder: (_) => _AccountSettingsDialog(
+        initialName: _userName,
+        onSaveName: (String newName) async {
+          await _storage.updateUserName(newName);
+          if (!mounted) return;
+          setState(() => _userName = newName);
+        },
+        onClearAllNotes: () async {
+          setState(() {
+            _notes.clear();
+            _rebuildFolderCounts();
+            _rebuildFilteredNotes();
+          });
+          await _storage.saveNotes(const <NoteModel>[]);
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Semua catatan berhasil dihapus.'),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
             ),
-            const SizedBox(height: 6),
-            TextField(
-              controller: nameEditController,
-              decoration: InputDecoration(
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () async {
-                  setState(() => _notes.clear());
-                  await _storage.saveNotes([]);
-                  if (!mounted) return;
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Semua catatan berhasil dihapus.'),
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.delete_forever, color: Colors.red),
-                label: const Text(
-                  'Hapus Semua Catatan',
-                  style: TextStyle(color: Colors.red),
-                ),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final newName = nameEditController.text.trim();
-              if (newName.isNotEmpty) {
-                await _storage.registerUser(newName, _userEmail, '123456');
-                setState(() => _userName = newName);
-              }
-              if (!mounted) return;
-              Navigator.pop(ctx);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1967D2),
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Simpan'),
-          ),
-        ],
+          );
+        },
       ),
     );
   }
 
   void _confirmLogout() {
-    showDialog(
+    showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (BuildContext ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Row(
-          children: [
+          children: <Widget>[
             Icon(Icons.logout_rounded, color: Colors.redAccent),
             SizedBox(width: 10),
-            Text('Konfirmasi Keluar', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(
+              'Konfirmasi Keluar',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
           ],
         ),
         content: const Text(
           'Apakah Anda yakin ingin keluar dari akun PindaiKu?',
           style: TextStyle(fontSize: 14),
         ),
-        actions: [
+        actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text(
@@ -345,9 +515,9 @@ class _HomeScreenState extends State<HomeScreen> {
               Navigator.pop(ctx);
               await _storage.logoutUser();
               if (!mounted) return;
-              Navigator.pushReplacement(
+              await Navigator.pushReplacement(
                 context,
-                MaterialPageRoute(builder: (_) => const LoginScreen()),
+                MaterialPageRoute<void>(builder: (_) => const LoginScreen()),
               );
             },
             style: ElevatedButton.styleFrom(
@@ -365,13 +535,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _showHelpDialog() {
-    showDialog(
+    showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (BuildContext ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: const Row(
-          children: [
-            Icon(Icons.help_outline, color: Color(0xFF00ACC1)),
+          children: <Widget>[
+            Icon(Icons.help_outline, color: AppConstants.accentCyan),
             SizedBox(width: 8),
             Text('Panduan PindaiKu'),
           ],
@@ -379,7 +549,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: const Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+          children: <Widget>[
             Text(
               '1. Tekan kartu "Mulai Pindai Cepat" atau ikon scan di tengah bawah.',
               style: TextStyle(fontSize: 13, height: 1.4),
@@ -401,11 +571,11 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-        actions: [
+        actions: <Widget>[
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx),
             style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1967D2),
+              backgroundColor: AppConstants.primaryBlue,
               foregroundColor: Colors.white,
             ),
             child: const Text('Mengerti'),
@@ -415,170 +585,174 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  String _formatDate(DateTime dt) {
-    const months = [
-      'januari',
-      'februari',
-      'maret',
-      'april',
-      'mei',
-      'juni',
-      'juli',
-      'agustus',
-      'september',
-      'oktober',
-      'november',
-      'desember',
-    ];
-    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
-  }
-
   void _showNoteDetail(NoteModel note) {
-    showModalBottomSheet(
+    showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (_) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.72,
-        maxChildSize: 0.92,
-        builder: (_, controller) => Padding(
-          padding: const EdgeInsets.all(24),
-          child: ListView(
-            controller: controller,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      Chip(
-                        label: Text(note.category),
-                        backgroundColor: const Color(0xFF1967D2)
-                            .withOpacity(0.12),
-                      ),
-                      Chip(
-                        label: Text(note.subject),
-                        backgroundColor: const Color(0xFF00ACC1)
-                            .withOpacity(0.15),
-                      ),
-                    ],
-                  ),
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.copy_rounded),
-                        tooltip: 'Salin Teks',
-                        onPressed: () {
-                          Clipboard.setData(ClipboardData(text: note.content));
-                          Navigator.pop(context);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Teks catatan disalin!'),
-                            ),
-                          );
-                        },
-                      ),
-                      IconButton(
-                        icon: const Icon(
-                          Icons.delete_outline,
-                          color: Colors.red,
+      builder: (BuildContext sheetContext) {
+        final int targetCacheHeight =
+            (180 * MediaQuery.devicePixelRatioOf(sheetContext)).round();
+
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.72,
+          maxChildSize: 0.92,
+          builder: (_, ScrollController controller) => Padding(
+            padding: const EdgeInsets.all(24),
+            child: ListView(
+              controller: controller,
+              children: <Widget>[
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: <Widget>[
+                    Wrap(
+                      spacing: 8,
+                      children: <Widget>[
+                        Chip(
+                          label: Text(note.category),
+                          backgroundColor: AppConstants.primaryBlue.withValues(
+                            alpha: 0.12,
+                          ),
                         ),
-                        tooltip: 'Hapus Dokumen',
-                        onPressed: () =>
-                            _confirmDeleteNote(note, fromModal: true),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Text(
-                note.title,
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
+                        Chip(
+                          label: Text(note.subject),
+                          backgroundColor: AppConstants.accentCyan.withValues(
+                            alpha: 0.15,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Row(
+                      children: <Widget>[
+                        IconButton(
+                          icon: const Icon(Icons.copy_rounded),
+                          tooltip: 'Salin Teks',
+                          onPressed: () {
+                            Clipboard.setData(
+                              ClipboardData(text: note.content),
+                            );
+                            Navigator.pop(context);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Teks catatan disalin!'),
+                                backgroundColor: Colors.teal,
+                                behavior: SnackBarBehavior.floating,
+                              ),
+                            );
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.delete_outline,
+                            color: Colors.red,
+                          ),
+                          tooltip: 'Hapus Dokumen',
+                          onPressed: () =>
+                              _confirmDeleteNote(note, fromModal: true),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-              ),
-              Text(
-                _formatDate(note.createdAt),
-                style: const TextStyle(fontSize: 12, color: Color(0xFF00ACC1)),
-              ),
-              const SizedBox(height: 16),
-              if (note.imagePath != null) ...[
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: kIsWeb
-                      ? Image.network(
-                          note.imagePath!,
-                          height: 180,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                        )
-                      : Image.file(
-                          File(note.imagePath!),
-                          height: 180,
-                          fit: BoxFit.cover,
-                        ),
+                const SizedBox(height: 8),
+                Text(
+                  note.title,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  AppConstants.formatIndonesianDate(note.createdAt),
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppConstants.accentCyan,
+                  ),
                 ),
                 const SizedBox(height: 16),
+                if (note.imagePath != null) ...<Widget>[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: kIsWeb
+                        ? Image.network(
+                            note.imagePath!,
+                            height: 180,
+                            cacheHeight: targetCacheHeight,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                          )
+                        : Image.file(
+                            File(note.imagePath!),
+                            height: 180,
+                            cacheHeight: targetCacheHeight,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                          ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                const Text(
+                  'Hasil Konversi Teks (OCR):',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade100,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    note.content,
+                    style: const TextStyle(fontSize: 14, height: 1.5),
+                  ),
+                ),
               ],
-              const Text(
-                'Hasil Konversi Teks (OCR):',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade100,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  note.content,
-                  style: const TextStyle(fontSize: 14, height: 1.5),
-                ),
-              ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
   Widget _buildFolderCard(String label) {
-    final isSelected = _selectedFolder == label;
-    final count = _notes.where((n) => n.category == label).length;
+    final bool isSelected = _selectedFolder == label;
+    final int count = _folderCounts[label] ?? 0;
 
     return GestureDetector(
       onTap: () {
         setState(() {
-          _selectedFolder = isSelected ? 'Semua' : label;
+          _selectedFolder = isSelected ? AppConstants.allFolders : label;
+          _rebuildFilteredNotes();
         });
       },
+      onLongPress: label == AppConstants.defaultFolder
+          ? null
+          : () => _confirmDeleteFolder(label),
       child: Column(
-        children: [
+        children: <Widget>[
           Container(
-            height: 84,
+            height: 75,
+            width: 85,
             decoration: BoxDecoration(
               color: isSelected
-                  ? const Color(0xFF00ACC1).withOpacity(0.18)
-                  : const Color(0xFFE0E0E0),
+                  ? AppConstants.accentCyan.withValues(alpha: 0.18)
+                  : AppConstants.folderIdleBg,
               borderRadius: BorderRadius.circular(14),
               border: isSelected
-                  ? Border.all(color: const Color(0xFF00ACC1), width: 2)
+                  ? Border.all(color: AppConstants.accentCyan, width: 2)
                   : null,
             ),
             child: Stack(
               alignment: Alignment.center,
-              children: [
+              children: <Widget>[
                 const Icon(
                   Icons.folder_outlined,
                   size: 44,
-                  color: Color(0xFF00ACC1),
+                  color: AppConstants.accentCyan,
                 ),
                 if (count > 0)
                   Positioned(
@@ -590,7 +764,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF1967D2),
+                        color: AppConstants.primaryBlue,
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Text(
@@ -614,7 +788,7 @@ class _HomeScreenState extends State<HomeScreen> {
             style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w600,
-              color: isSelected ? const Color(0xFF00ACC1) : Colors.black87,
+              color: isSelected ? AppConstants.accentCyan : Colors.black87,
             ),
           ),
         ],
@@ -622,350 +796,534 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildNoteTile(NoteModel note) {
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(vertical: 2),
+      leading: Container(
+        width: 42,
+        height: 42,
+        decoration: BoxDecoration(
+          color: Colors.grey.shade200,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: const Icon(
+          Icons.description_outlined,
+          color: AppConstants.accentCyan,
+        ),
+      ),
+      title: Text(
+        note.title,
+        style: const TextStyle(
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      subtitle: Text(
+        '${AppConstants.formatIndonesianDate(note.createdAt)} • ${note.category}',
+        style: const TextStyle(
+          fontSize: 12,
+          color: AppConstants.accentCyan,
+        ),
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          IconButton(
+            icon: const Icon(
+              Icons.delete_outline,
+              color: Colors.redAccent,
+              size: 20,
+            ),
+            tooltip: 'Hapus',
+            onPressed: () => _confirmDeleteNote(note),
+          ),
+          const Icon(
+            Icons.chevron_right,
+            color: Colors.black54,
+          ),
+        ],
+      ),
+      onTap: () => _showNoteDetail(note),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final filteredNotes = _notes.where((n) {
-      final matchSearch =
-          n.title.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-          n.subject.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-          n.content.toLowerCase().contains(_searchQuery.toLowerCase());
-      final matchFolder =
-          _selectedFolder == 'Semua' || n.category == _selectedFolder;
-      return matchSearch && matchFolder;
-    }).toList();
-
     return Scaffold(
       backgroundColor: Colors.white,
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(22, 16, 22, 90),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  GestureDetector(
-                    onTap: _showSettingsDialog,
-                    child: const Icon(
-                      Icons.person_outline,
-                      size: 28,
-                      color: Colors.black87,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(
-                      Icons.notifications_none,
-                      size: 28,
-                      color: Colors.black87,
-                    ),
-                    onPressed: _showNotificationsDialog,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Halo, $_userName!',
-                style: const TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF1A1A1A),
-                ),
-              ),
-              const SizedBox(height: 14),
-              SizedBox(
-                height: 42,
-                child: TextField(
-                  controller: _searchController,
-                  onChanged: (val) => setState(() => _searchQuery = val),
-                  decoration: InputDecoration(
-                    hintText: 'Cari catatan atau dokumen...',
-                    hintStyle: TextStyle(
-                      fontSize: 13,
-                      color: Colors.grey.shade400,
-                    ),
-                    prefixIcon: const Icon(
-                      Icons.search,
-                      size: 20,
-                      color: Colors.black54,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(vertical: 0),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.grey.shade300),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.grey.shade300),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 18),
-              GestureDetector(
-                onTap: _openScanner,
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF00ACC1),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Row(
-                    children: [
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Mulai Pindai Cepat',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 19,
-                                fontWeight: FontWeight.bold,
+      body: Stack(
+        children: <Widget>[
+          SafeArea(
+            child: CustomScrollView(
+              slivers: <Widget>[
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(22, 16, 22, 0),
+                  sliver: SliverToBoxAdapter(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: <Widget>[
+                            GestureDetector(
+                              onTap: _showSettingsDialog,
+                              child: const Icon(
+                                Icons.person_outline,
+                                size: 28,
+                                color: Colors.black87,
                               ),
                             ),
-                            SizedBox(height: 6),
-                            Text(
-                              'Foto teks dan ubah\nmenjadi teks digital',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 13,
-                                height: 1.3,
+                            IconButton(
+                              icon: const Icon(
+                                Icons.notifications_none,
+                                size: 28,
+                                color: Colors.black87,
                               ),
+                              onPressed: _showNotificationsDialog,
                             ),
                           ],
                         ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.white, width: 3.5),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Icon(
-                          Icons.note_add_outlined,
-                          color: Colors.white,
-                          size: 46,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 22),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
-                    children: [
-                      const Text(
-                        'Folder Dokumen',
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(width: 10),
-                      GestureDetector(
-                        onTap: _showCreateFolderDialog,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF00ACC1).withOpacity(0.12),
-                            borderRadius: BorderRadius.circular(12),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Halo, $_userName!',
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color: AppConstants.textDark,
                           ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.add, size: 14, color: Color(0xFF00ACC1)),
-                              SizedBox(width: 2),
-                              Text(
-                                'Folder Baru',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Color(0xFF00ACC1),
-                                  fontWeight: FontWeight.bold,
+                        ),
+                        const SizedBox(height: 14),
+                        SizedBox(
+                          height: 42,
+                          child: TextField(
+                            controller: _searchController,
+                            onChanged: (String val) {
+                              setState(() {
+                                _searchQuery = val;
+                                _rebuildFilteredNotes();
+                              });
+                            },
+                            decoration: InputDecoration(
+                              hintText: 'Cari catatan atau dokumen...',
+                              hintStyle: TextStyle(
+                                fontSize: 13,
+                                color: Colors.grey.shade400,
+                              ),
+                              prefixIcon: const Icon(
+                                Icons.search,
+                                size: 20,
+                                color: Colors.black54,
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(
+                                vertical: 0,
+                              ),
+                              border: AppConstants.inputBorder,
+                              enabledBorder: AppConstants.inputBorder,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        GestureDetector(
+                          onTap: _openScanner,
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: AppConstants.accentCyan,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Row(
+                              children: <Widget>[
+                                const Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        'Mulai Pindai Cepat',
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 19,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      SizedBox(height: 6),
+                                      Text(
+                                        'Foto teks dan ubah\nmenjadi teks digital',
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 13,
+                                          height: 1.3,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 3.5,
+                                    ),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: const Icon(
+                                    Icons.note_add_outlined,
+                                    color: Colors.white,
+                                    size: 46,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: <Widget>[
+                            Row(
+                              children: <Widget>[
+                                const Text(
+                                  'Folder',
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                if (_selectedFolder !=
+                                        AppConstants.allFolders &&
+                                    _selectedFolder !=
+                                        AppConstants.defaultFolder)
+                                  GestureDetector(
+                                    onTap: () =>
+                                        _confirmDeleteFolder(_selectedFolder),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.redAccent.withValues(
+                                          alpha: 0.12,
+                                        ),
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: const Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: <Widget>[
+                                          Icon(
+                                            Icons.delete_outline,
+                                            size: 14,
+                                            color: Colors.redAccent,
+                                          ),
+                                          SizedBox(width: 4),
+                                          Text(
+                                            'Hapus Folder',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.redAccent,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            if (_selectedFolder != AppConstants.allFolders)
+                              GestureDetector(
+                                onTap: () => setState(() {
+                                  _selectedFolder = AppConstants.allFolders;
+                                  _rebuildFilteredNotes();
+                                }),
+                                child: const Text(
+                                  'Tampilkan Semua',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: AppConstants.primaryBlue,
+                                    fontWeight: FontWeight.bold,
+                                  ),
                                 ),
                               ),
-                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        SizedBox(
+                          height: 114,
+                          child: ListView.separated(
+                            scrollDirection: Axis.horizontal,
+                            itemCount: _folders.length,
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(width: 12),
+                            itemBuilder: (BuildContext context, int index) {
+                              final String f = _folders[index];
+                              return SizedBox(
+                                width: 105,
+                                child: _buildFolderCard(f),
+                              );
+                            },
                           ),
                         ),
-                      ),
-                    ],
+                        const SizedBox(height: 22),
+                        Text(
+                          _selectedFolder == AppConstants.allFolders
+                              ? 'Pemindaian Terbaru'
+                              : 'Folder: $_selectedFolder (${_filteredNotes.length})',
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                      ],
+                    ),
                   ),
-                  if (_selectedFolder != 'Semua')
-                    GestureDetector(
-                      onTap: () => setState(() => _selectedFolder = 'Semua'),
-                      child: const Text(
-                        'Tampilkan Semua',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF1967D2),
-                          fontWeight: FontWeight.bold,
+                ),
+                if (_filteredNotes.isEmpty)
+                  SliverPadding(
+                    padding: const EdgeInsets.fromLTRB(22, 20, 22, 110),
+                    sliver: SliverToBoxAdapter(
+                      child: Center(
+                        child: Text(
+                          _selectedFolder == AppConstants.allFolders
+                              ? 'Belum ada pemindaian. Tekan tombol scan di bawah!'
+                              : 'Belum ada dokumen di folder "$_selectedFolder".',
+                          style: TextStyle(
+                            color: Colors.grey.shade500,
+                            fontSize: 13,
+                          ),
                         ),
                       ),
                     ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              SizedBox(
-                height: 114,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: _folders.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 12),
-                  itemBuilder: (context, index) {
-                    final f = _folders[index];
-                    return SizedBox(
-                      width: 105,
-                      child: _buildFolderCard(f),
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(height: 22),
-              Text(
-                _selectedFolder == 'Semua'
-                    ? 'Pemindaian Terbaru'
-                    : 'Folder: $_selectedFolder (${filteredNotes.length})',
-                style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 10),
-              if (filteredNotes.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 20),
-                  child: Center(
-                    child: Text(
-                      _selectedFolder == 'Semua'
-                          ? 'Belum ada pemindaian. Tekan tombol scan di bawah!'
-                          : 'Belum ada dokumen di folder "$_selectedFolder".',
-                      style: TextStyle(
-                        color: Colors.grey.shade500,
-                        fontSize: 13,
-                      ),
+                  )
+                else
+                  SliverPadding(
+                    padding: const EdgeInsets.fromLTRB(22, 0, 22, 90),
+                    sliver: SliverList.builder(
+                      itemCount: _filteredNotes.length,
+                      itemBuilder: (BuildContext context, int index) {
+                        return _buildNoteTile(_filteredNotes[index]);
+                      },
                     ),
                   ),
-                )
-              else
-                ListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: filteredNotes.length,
-                  itemBuilder: (context, index) {
-                    final note = filteredNotes[index];
-                    return ListTile(
-                      contentPadding: const EdgeInsets.symmetric(vertical: 2),
-                      leading: Container(
-                        width: 42,
-                        height: 42,
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade200,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(
-                          Icons.description_outlined,
-                          color: Color(0xFF00ACC1),
-                        ),
-                      ),
-                      title: Text(
-                        note.title,
-                        style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      subtitle: Text(
-                        '${_formatDate(note.createdAt)} • ${note.category}',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF00ACC1),
-                        ),
-                      ),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(
-                              Icons.delete_outline,
-                              color: Colors.redAccent,
-                              size: 20,
-                            ),
-                            tooltip: 'Hapus',
-                            onPressed: () => _confirmDeleteNote(note),
-                          ),
-                          const Icon(
-                            Icons.chevron_right,
-                            color: Colors.black54,
-                          ),
-                        ],
-                      ),
-                      onTap: () => _showNoteDetail(note),
-                    );
-                  },
-                ),
-            ],
+              ],
+            ),
           ),
-        ),
+          Positioned(
+            bottom: 24,
+            right: 24,
+            child: FloatingActionButton(
+              heroTag: 'addFolderFAB',
+              onPressed: _showCreateFolderModal,
+              backgroundColor: AppConstants.accentCyan,
+              elevation: 4,
+              child: const Icon(
+                Icons.create_new_folder_outlined,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ],
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
-      floatingActionButton: GestureDetector(
-        onTap: _openScanner,
-        child: Container(
-          width: 56,
-          height: 56,
-          decoration: BoxDecoration(
-            color: const Color(0xFFE0E0E0),
-            borderRadius: BorderRadius.circular(14),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.15),
-                blurRadius: 8,
-                offset: const Offset(0, 3),
-              ),
-            ],
-          ),
+      floatingActionButton: Container(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: <BoxShadow>[
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.25),
+              blurRadius: 8,
+              spreadRadius: 2,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: FloatingActionButton(
+          onPressed: _openScanner,
+          backgroundColor: Colors.white,
+          elevation: 0,
+          shape: const CircleBorder(),
           child: const Icon(
             Icons.document_scanner_outlined,
-            color: Colors.black87,
+            color: AppConstants.accentCyan,
             size: 28,
           ),
         ),
       ),
       bottomNavigationBar: BottomAppBar(
-        color: const Color(0xFF1967D2),
-        height: 60,
+        color: AppConstants.accentCyan,
+        shape: const CircularNotchedRectangle(),
+        notchMargin: 8.0,
+        height: 65,
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
+          children: <Widget>[
             IconButton(
-              icon: const Icon(Icons.home_outlined, color: Colors.black87),
+              icon: const Icon(Icons.home_outlined, color: Colors.white),
               tooltip: 'Beranda',
               onPressed: () => setState(() {
-                _selectedFolder = 'Semua';
+                _selectedFolder = AppConstants.allFolders;
                 _searchController.clear();
                 _searchQuery = '';
+                _rebuildFilteredNotes();
               }),
             ),
             IconButton(
-              icon: const Icon(Icons.settings_outlined, color: Colors.black87),
+              icon: const Icon(Icons.settings_outlined, color: Colors.white),
               tooltip: 'Pengaturan',
               onPressed: _showSettingsDialog,
             ),
             const SizedBox(width: 48),
             IconButton(
-              icon: const Icon(Icons.help_outline, color: Colors.black87),
+              icon: const Icon(Icons.help_outline, color: Colors.white),
               tooltip: 'Bantuan',
               onPressed: _showHelpDialog,
             ),
             IconButton(
-              icon: const Icon(Icons.logout_rounded, color: Colors.black87),
+              icon: const Icon(Icons.logout_rounded, color: Colors.white),
               tooltip: 'Keluar Akun',
               onPressed: _confirmLogout,
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _AccountSettingsDialog extends StatefulWidget {
+  final String initialName;
+  final Future<void> Function(String newName) onSaveName;
+  final Future<void> Function() onClearAllNotes;
+
+  const _AccountSettingsDialog({
+    required this.initialName,
+    required this.onSaveName,
+    required this.onClearAllNotes,
+  });
+
+  @override
+  State<_AccountSettingsDialog> createState() => _AccountSettingsDialogState();
+}
+
+class _AccountSettingsDialogState extends State<_AccountSettingsDialog> {
+  late final TextEditingController _nameEditController;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameEditController = TextEditingController(text: widget.initialName);
+  }
+
+  @override
+  void dispose() {
+    _nameEditController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      title: const Row(
+        children: <Widget>[
+          Icon(Icons.settings, color: AppConstants.primaryBlue),
+          SizedBox(width: 8),
+          Text('Pengaturan Akun'),
+        ],
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          const Text(
+            'Ubah Nama Tampilan',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _nameEditController,
+            decoration: InputDecoration(
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                final bool? confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (BuildContext ctxConfirm) => AlertDialog(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    title: const Text('Hapus Semua Catatan?'),
+                    content: const Text(
+                      'Yakin ingin menghapus semua catatan secara permanen? Aksi ini tidak dapat dibatalkan.',
+                    ),
+                    actions: <Widget>[
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctxConfirm, false),
+                        child: const Text('Batal'),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => Navigator.pop(ctxConfirm, true),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: const Text('Hapus Semua'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (confirm == true) {
+                  await widget.onClearAllNotes();
+                  if (!context.mounted) return;
+                  Navigator.pop(context);
+                }
+              },
+              icon: const Icon(Icons.delete_forever, color: Colors.red),
+              label: const Text(
+                'Hapus Semua Catatan',
+                style: TextStyle(color: Colors.red),
+              ),
+            ),
+          ),
+        ],
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        ElevatedButton(
+          onPressed: () async {
+            final String newName = _nameEditController.text.trim();
+            if (newName.isNotEmpty) {
+              await widget.onSaveName(newName);
+            }
+            if (!context.mounted) return;
+            Navigator.pop(context);
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppConstants.primaryBlue,
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Simpan'),
+        ),
+      ],
     );
   }
 }

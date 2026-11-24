@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../services/storage_service.dart';
-import 'home_screen.dart';
+import '../utils/app_constants.dart';
+import '../widgets/shared_widgets.dart';
 import 'login_screen.dart';
 
 class RegisterScreen extends StatefulWidget {
@@ -12,33 +13,60 @@ class RegisterScreen extends StatefulWidget {
 }
 
 class _RegisterScreenState extends State<RegisterScreen> {
-  final _nameController = TextEditingController();
-  final _emailController = TextEditingController();
-  final _passController = TextEditingController();
-  final _storage = StorageService();
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passController = TextEditingController();
+  final StorageService _storage = StorageService();
   bool _obscurePass = true;
+  bool _isSubmitting = false;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _emailController.dispose();
+    _passController.dispose();
+    super.dispose();
+  }
 
   Future<void> _register() async {
-    if (_nameController.text.trim().isEmpty ||
-        _emailController.text.trim().isEmpty ||
-        _passController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Semua kolom wajib diisi!')));
+    if (_isSubmitting) return;
+
+    final String name = _nameController.text.trim();
+    final String email = _emailController.text.trim();
+    final String password = _passController.text.trim();
+
+    if (name.isEmpty || email.isEmpty || password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Semua kolom wajib diisi!'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
       return;
     }
 
-    await _storage.registerUser(
-      _nameController.text.trim(),
-      _emailController.text.trim(),
-      _passController.text.trim(),
-    );
+    _isSubmitting = true;
+    try {
+      await _storage.registerUser(name, email, password);
 
-    if (!mounted) return;
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (_) => const HomeScreen()),
-    );
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Pendaftaran berhasil! Silakan login.'),
+          backgroundColor: Colors.green,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+
+      await Navigator.pushReplacement(
+        context,
+        MaterialPageRoute<void>(builder: (_) => const LoginScreen()),
+      );
+    } finally {
+      _isSubmitting = false;
+    }
   }
 
   @override
@@ -52,74 +80,65 @@ class _RegisterScreenState extends State<RegisterScreen> {
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 400),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Daftar',
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF1967D2),
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: <Widget>[
+                  const Center(child: PindaiKuLogo()),
+                  const SizedBox(height: 54),
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Nama Lengkap',
+                      style: TextStyle(fontSize: 13, color: Colors.black87),
                     ),
-                  ),
-                  const SizedBox(height: 36),
-                  const Text(
-                    'Nama Lengkap',
-                    style: TextStyle(fontSize: 13, color: Colors.black87),
                   ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _nameController,
-                    decoration: InputDecoration(
-                      suffixIcon: const Icon(Icons.person_outline, size: 20),
-                      contentPadding: const EdgeInsets.symmetric(
+                    decoration: const InputDecoration(
+                      suffixIcon: Icon(Icons.person_outline, size: 20),
+                      contentPadding: EdgeInsets.symmetric(
                         horizontal: 16,
                         vertical: 14,
                       ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
+                      border: AppConstants.inputBorder,
+                      enabledBorder: AppConstants.inputBorder,
                     ),
                   ),
                   const SizedBox(height: 20),
-                  const Text(
-                    'Email',
-                    style: TextStyle(fontSize: 13, color: Colors.black87),
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Email',
+                      style: TextStyle(fontSize: 13, color: Colors.black87),
+                    ),
                   ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _emailController,
                     keyboardType: TextInputType.emailAddress,
-                    decoration: InputDecoration(
-                      suffixIcon: const Icon(Icons.mail_outline, size: 20),
-                      contentPadding: const EdgeInsets.symmetric(
+                    decoration: const InputDecoration(
+                      suffixIcon: Icon(Icons.mail_outline, size: 20),
+                      contentPadding: EdgeInsets.symmetric(
                         horizontal: 16,
                         vertical: 14,
                       ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
+                      border: AppConstants.inputBorder,
+                      enabledBorder: AppConstants.inputBorder,
                     ),
                   ),
                   const SizedBox(height: 20),
-                  const Text(
-                    'Kata Sandi',
-                    style: TextStyle(fontSize: 13, color: Colors.black87),
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Kata Sandi',
+                      style: TextStyle(fontSize: 13, color: Colors.black87),
+                    ),
                   ),
                   const SizedBox(height: 8),
                   TextField(
                     controller: _passController,
                     obscureText: _obscurePass,
+                    onSubmitted: (_) => _register(),
                     decoration: InputDecoration(
                       suffixIcon: IconButton(
                         icon: Icon(
@@ -135,14 +154,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
                         horizontal: 16,
                         vertical: 14,
                       ),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade300),
-                      ),
+                      border: AppConstants.inputBorder,
+                      enabledBorder: AppConstants.inputBorder,
                     ),
                   ),
                   const SizedBox(height: 36),
@@ -152,7 +165,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                     child: ElevatedButton(
                       onPressed: _register,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF1967D2),
+                        backgroundColor: AppConstants.primaryBlue,
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(24),
@@ -171,7 +184,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   const SizedBox(height: 16),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
+                    children: <Widget>[
                       const Text(
                         'Sudah punya akun? ',
                         style: TextStyle(fontSize: 12, color: Colors.grey),
@@ -179,7 +192,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                       GestureDetector(
                         onTap: () => Navigator.pushReplacement(
                           context,
-                          MaterialPageRoute(
+                          MaterialPageRoute<void>(
                             builder: (_) => const LoginScreen(),
                           ),
                         ),
@@ -187,7 +200,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                           'Masuk',
                           style: TextStyle(
                             fontSize: 12,
-                            color: Color(0xFF1967D2),
+                            color: AppConstants.primaryBlue,
                             fontWeight: FontWeight.bold,
                           ),
                         ),

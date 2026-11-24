@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/storage_service.dart';
+import 'utils/app_constants.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,23 +19,45 @@ class PindaiKuApp extends StatelessWidget {
       title: 'PindaiKu',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1967D2)),
+        colorScheme: ColorScheme.fromSeed(seedColor: AppConstants.primaryBlue),
         useMaterial3: true,
       ),
-      home: FutureBuilder(
-        future: StorageService().getActiveUser(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
-            );
-          }
-          if (snapshot.data != null) {
-            return const HomeScreen();
-          }
-          return const LoginScreen();
-        },
-      ),
+      home: const _InitialAuthGate(),
+    );
+  }
+}
+
+class _InitialAuthGate extends StatefulWidget {
+  const _InitialAuthGate();
+
+  @override
+  State<_InitialAuthGate> createState() => _InitialAuthGateState();
+}
+
+class _InitialAuthGateState extends State<_InitialAuthGate> {
+  late final Future<ActiveUser?> _activeUserFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _activeUserFuture = StorageService().getActiveUser();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<ActiveUser?>(
+      future: _activeUserFuture,
+      builder: (BuildContext context, AsyncSnapshot<ActiveUser?> snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        if (snapshot.data != null) {
+          return const HomeScreen();
+        }
+        return const LoginScreen();
+      },
     );
   }
 }
